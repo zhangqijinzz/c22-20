@@ -33,6 +33,15 @@ button:disabled { cursor: not-allowed !important; opacity: .5; }
 .brand-lockup strong { display: block; font: 800 17px/1.1 Manrope, sans-serif; letter-spacing: -.65px; color: #203a35; }
 .brand-lockup small { display: block; margin-top: 5px; font: 500 8px/1 'DM Mono', monospace; letter-spacing: 1.05px; color: #97a49f; }
 .project-switcher { position: relative; margin: 34px 5px 26px; padding: 14px 12px 12px; background: #f3f7f4; border: 1px solid #e9efeb; border-radius: 11px; }
+.project-switcher-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.unsaved-chip { flex: 0 0 auto; padding: 2px 6px; border: 1px solid #eed9b8; border-radius: 20px; background: #fdf5e7; color: #a6782f; font: 700 7px/1.4 'DM Mono', monospace; letter-spacing: .4px; }
+.project-switcher-actions { display: flex; align-items: center; gap: 4px; margin: 9px 0 10px; }
+.project-action { display: inline-flex; align-items: center; gap: 4px; flex: 1 1 0; min-width: 0; justify-content: center; padding: 6px 4px; border: 1px solid #e1ebe5; border-radius: 6px; background: #fff; color: #5d786c; font-size: 8px; font-weight: 650; white-space: nowrap; cursor: pointer; transition: border-color .15s ease, background .15s ease, color .15s ease; }
+.project-action span { font-size: 10px; line-height: 1; color: #7fa18f; }
+.project-action:hover { border-color: #9cc4af; background: #f3f9f5; color: #2f6f57; }
+.project-action:hover span { color: #2f8a68; }
+.project-action-danger:hover { border-color: #e3b4ab; background: #fdf4f2; color: #ad5f53; }
+.project-action-danger:hover span { color: #bd6e62; }
 .eyebrow { display: block; color: #8c9b96; font: 500 9px/1.5 'DM Mono', monospace; letter-spacing: 1.05px; text-transform: uppercase; }
 .project-switcher select { appearance: none; width: 100%; padding: 8px 18px 6px 0; border: 0; background: transparent; color: #283e39; font-size: 12px; font-weight: 700; cursor: pointer; text-overflow: ellipsis; }
 .project-switcher::after { content: '⌄'; position: absolute; right: 12px; bottom: 18px; color: #7a8f88; pointer-events: none; font-size: 15px; }
@@ -98,6 +107,8 @@ button:disabled { cursor: not-allowed !important; opacity: .5; }
 .phase-checking::before { background: #5eaaa1; animation: pulse 1s infinite alternate; }
 .title-more-button { width: 28px; height: 28px; border: 1px solid #e1e9e5; border-radius: 6px; background: white; color: #789087; font-size: 16px; cursor: pointer; }
 .title-more-button:hover { border-color: #a3c5b4; color: #176a5b; }
+.title-delete-button:hover { border-color: #e0b3aa; background: #fdf4f2; color: #b25f53; }
+.title-unsaved { font-style: normal; color: #a6782f; letter-spacing: .5px; }
 .status-message { min-height: 24px; display: flex; align-items: center; gap: 7px; color: #95a29d; font-size: 9px; }
 .status-message > span { color: #7cad96; font-size: 13px; }
 .status-message-error { color: #b8695f; }
@@ -131,6 +142,9 @@ button:disabled { cursor: not-allowed !important; opacity: .5; }
 .button-outline { border-color: #c8dcd1; background: #f6faf7; color: #41705e; }
 .button-outline:hover { border-color: #88b79d; background: #eef7f0; }
 .button-quiet { border-color: #eadbc8; background: #fffaf3; color: #987447; }
+.button-danger { border-color: #c16a5d; background: #c16a5d; color: #fff; box-shadow: 0 3px 9px rgba(193,106,93,.16); }
+.button-danger:hover { background: #b15c50; }
+.button-danger > span { font-size: 12px; font-weight: 400; }
 .button-icon { color: #4a9476; font-size: 12px; }
 .text-button { padding: 3px 1px; border: 0; background: transparent; color: #4c9076; font-size: 9px; font-weight: 650; cursor: pointer; }
 .text-button:hover { color: #176a5b; text-decoration: underline; text-underline-offset: 3px; }
@@ -328,6 +342,17 @@ button:disabled { cursor: not-allowed !important; opacity: .5; }
 .startup-state { min-height: calc(100vh - 60px); display: flex; align-items: center; flex-direction: column; justify-content: center; gap: 11px; color: #71827a; }
 .startup-state strong { margin-top: 3px; font-size: 12px; }
 .startup-state span { color: #9ca8a2; font-size: 9px; }
+
+.modal-backdrop { position: fixed; inset: 0; z-index: 40; display: flex; align-items: center; justify-content: center; padding: 20px; background: rgba(30, 48, 42, .34); backdrop-filter: blur(2px); animation: modal-fade .16s ease both; }
+.confirm-dialog { width: min(420px, 100%); padding: 24px 24px 20px; text-align: left; animation: modal-pop .18s ease both; }
+.confirm-icon { width: 34px; height: 34px; display: grid; place-items: center; margin-bottom: 14px; border-radius: 50%; background: #fbeae7; color: #bd6155; font: 800 16px Manrope, sans-serif; }
+.confirm-dialog h2 { margin: 0 0 8px; color: #31473f; font: 700 16px/1.35 Manrope, 'Noto Sans SC', sans-serif; letter-spacing: -.3px; }
+.confirm-dialog p { margin: 0 0 18px; color: #82908a; font-size: 11px; line-height: 1.7; }
+.confirm-dialog p strong { color: #465a52; font-weight: 700; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 9px; }
+
+@keyframes modal-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes modal-pop { from { opacity: 0; transform: translateY(6px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes pulse { to { opacity: .4; } }

@@ -50,3 +50,13 @@ export function cloneData<T>(value: T): T {
 export function makeId(prefix: string): string {
   return `${prefix}-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
 }
+
+/** Return a title not already taken, appending " 副本 2", " 副本 3", … as needed. */
+export function uniqueTitle(preferred: string, existing: readonly string[]): string {
+  const taken = new Set(existing);
+  if (!taken.has(preferred)) return preferred;
+  for (let ordinal = 2; ; ordinal += 1) {
+    const candidate = `${preferred} ${ordinal}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+}

@@ -7,7 +7,7 @@ import type {
   SampleEvaluation,
   WorkspaceDocument,
 } from '../models/ruleModel';
-import { cloneData, createBlankProject, createDemoWorkspace, createVersionSnapshot, makeId } from '../models/projectFactory';
+import { cloneData, createBlankProject, createDemoWorkspace, createVersionSnapshot, makeId, uniqueTitle } from '../models/projectFactory';
 import { RuleRepository } from '../repositories/ruleRepository';
 import { ProjectStorageService } from '../services/projectStorageService';
 import { RuleCheckService, type CheckOperation } from '../services/ruleCheckService';
@@ -29,7 +29,13 @@ export interface WorkspaceState {
   selectedRuleId?: string;
   notice: string;
   saveError?: string;
+  /** Projects whose in-memory edits have not finished persisting. */
+  dirtyProjectIds: string[];
+  /** Set when deleting a project that still carries unsaved edits, awaiting confirmation. */
+  pendingDeleteProjectId?: string;
 }
+
+export type DeleteProjectOutcome = 'deleted' | 'last-project' | 'needs-confirmation' | 'not-found';
 
 type Listener = () => void;
 type WorkspaceRepository = Pick<RuleRepository, 'load' | 'save'>;
@@ -40,6 +46,7 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     phase: 'loading', persistence: 'idle', workspace: null, project: null,
     activeModule: 'inspection', checkStatus: 'idle', analysis: null,
     validationIssues: [], sampleEvaluation: null, notice: '正在恢复本地规则项目…',
+    dirtyProjectIds: [],
   };
   private readonly listeners = new Set<Listener>();
   private startPromise?: Promise<void>;
@@ -72,11 +79,11 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     if (this.saveTimer && this.state.workspace) {
       clearTimeout(this.saveTimer);
       this.saveTimer = undefined;
-      this.enqueueSave(this.state.workspace, this.saveRevision);
+      const pendingDirtyIds = this.state.dirtyProjectIds;
+      this.enqueueSave(this.state.workspace, this.saveRevision, pendingDirtyIds);
     }
     await this.writeQueue;
   }
-
   dispose(): void {
     if (this.saveTimer) clearTimeout(this.saveTimer);
     if (this.checkTimer) clearTimeout(this.checkTimer);
@@ -108,7 +115,73 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
 
   renameProject(title: string): void {
     const project = this.state.project;
-    if (project) this.commitProject({ ...project, title }, '项目名称已更新', { recheck: false });
+    if (!project || title === project.title) return;
+    if (!title.trim()) {
+      this.updateView({ notice: '项目名称不能为空。' });
+      return;
+    }
+    this.commitProject({ ...project, title }, '项目名称已更新', { recheck: false });
+  }
+
+  /**
+   * Produce a complete, independent copy of a project: fields, rules, sample
+   * inputs and the full version history all come along. The copy is always
+   * editable, so a frozen source is not copied as frozen.
+   */
+  duplicateProject(projectId?: string): void {
+    const workspace = this.state.workspace;
+    const source = workspace?.projects.find((candidate) => candidate.id === (projectId ?? this.state.project?.id));
+    if (!workspace || !source) return;
+    const copy: RuleProject = {
+      ...cloneData(source),
+      id: makeId('project'),
+      title: uniqueTitle(`${source.title} 副本`, workspace.projects.map((item) => item.title)),
+      frozenVersionId: undefined,
+      updatedAt: Date.now(),
+    };
+    const next = { ...workspace, projects: [...workspace.projects, copy], activeProjectId: copy.id };
+    const issues = ruleDomain.validateProject(copy);
+    this.publish({ ...this.activateProject(next, copy), notice: `已复制出完整副本“${copy.title}”，包含字段、规则、样例与 ${copy.versions.length} 条版本记录` });
+    this.scheduleSave(next, { dirtyProjectId: copy.id });
+    if (!issues.length) this.scheduleCheck(80);
+  }
+
+  /**
+   * Remove a project. A project carrying unsaved edits must be confirmed first
+   * (the pending edits are discarded); deleting the last remaining project is
+   * refused so the workspace always has somewhere to land.
+   */
+  requestDeleteProject(projectId?: string): DeleteProjectOutcome {
+    const workspace = this.state.workspace;
+    const targetId = projectId ?? this.state.project?.id;
+    const target = workspace?.projects.find((candidate) => candidate.id === targetId);
+    if (!workspace || !target) return 'not-found';
+    if (workspace.projects.length <= 1) {
+      this.updateView({ notice: '至少需要保留一个项目，无法删除最后一个项目。' });
+      return 'last-project';
+    }
+    if (this.isDirty(target.id)) {
+      this.updateView({ pendingDeleteProjectId: target.id, notice: `“${target.title}”还有未保存的改动，删除前需要确认。` });
+      return 'needs-confirmation';
+    }
+    this.deleteProject(target.id);
+    return 'deleted';
+  }
+
+  confirmDeleteProject(): void {
+    const targetId = this.state.pendingDeleteProjectId;
+    if (!targetId) return;
+    this.updateView({ pendingDeleteProjectId: undefined });
+    this.deleteProject(targetId);
+  }
+
+  cancelDeleteProject(): void {
+    const target = this.state.workspace?.projects.find((item) => item.id === this.state.pendingDeleteProjectId);
+    this.updateView({ pendingDeleteProjectId: undefined, notice: target ? `已保留项目“${target.title}”` : '' });
+  }
+
+  isProjectDirty(projectId: string): boolean {
+    return this.isDirty(projectId);
   }
 
   async runCheck(): Promise<void> {
@@ -159,18 +232,32 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     if (!workspace) return;
     const project = createBlankProject(workspace.projects.length + 1);
     const next: WorkspaceDocument = { ...workspace, projects: [...workspace.projects, project], activeProjectId: project.id };
-    this.publish({ ...this.state, workspace: next, project, phase: 'validating', activeModule: 'fields', analysis: null, checkStatus: 'idle', validationIssues: ruleDomain.validateProject(project), sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: undefined, notice: '空项目已创建。先定义字段，再添加规则。' });
-    this.scheduleSave(next);
+    this.publish({
+      ...this.activateProject(next, project, { activeModule: 'fields' }),
+      phase: 'validating',
+      notice: '空项目已创建。先定义字段，再添加规则。',
+    });
+    this.scheduleSave(next, { dirtyProjectId: project.id });
   }
 
-  switchProject(projectId: string): void {
+  async switchProject(projectId: string): Promise<void> {
     const workspace = this.state.workspace;
     const project = workspace?.projects.find((candidate) => candidate.id === projectId);
     if (!workspace || !project || workspace.activeProjectId === projectId) return;
+    // Persist edits to the project being left before anything else can touch it.
+    await this.flushSave();
+    // Any computation still running belongs to the previous project; drop it so
+    // neither its progress nor its result can leak into the project we enter.
     this.cancelCheck();
     const next = { ...workspace, activeProjectId: projectId };
     const issues = ruleDomain.validateProject(project);
-    this.publish({ ...this.state, workspace: next, project, phase: issues.length ? 'validating' : 'editing', activeModule: 'inspection', checkStatus: issues.length ? 'idle' : 'scheduled', analysis: null, validationIssues: issues, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice: `已切换到“${project.title}”` });
+    this.publish({
+      ...this.activateProject(next, project),
+      phase: issues.length ? 'validating' : 'editing',
+      checkStatus: issues.length ? 'idle' : 'scheduled',
+      notice: `已切换到“${project.title}”`,
+    });
+    // Only the active selection changed; no project content was edited here.
     this.scheduleSave(next);
     if (!issues.length) this.scheduleCheck(80);
   }
@@ -203,14 +290,14 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     const version = source?.versions.find((candidate) => candidate.id === versionId);
     if (!workspace || !source || !version) return;
     const project: RuleProject = {
-      id: makeId('project'), title: `${source.title} · ${version.name}副本`,
+      id: makeId('project'), title: uniqueTitle(`${source.title} · ${version.name}副本`, workspace.projects.map((item) => item.title)),
       fields: cloneData(version.fields), rules: cloneData(version.rules), sampleInputs: cloneData(version.sampleInputs),
       versions: [], updatedAt: Date.now(),
     };
     const next = { ...workspace, projects: [...workspace.projects, project], activeProjectId: project.id };
     const issues = ruleDomain.validateProject(project);
-    this.publish({ ...this.state, workspace: next, project, phase: issues.length ? 'validating' : 'editing', activeModule: 'rules', checkStatus: issues.length ? 'idle' : 'scheduled', analysis: null, validationIssues: issues, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice: `已复制版本到项目“${project.title}”` });
-    this.scheduleSave(next);
+    this.publish({ ...this.activateProject(next, project, { activeModule: 'rules' }), phase: issues.length ? 'validating' : 'editing', checkStatus: issues.length ? 'idle' : 'scheduled', notice: `已复制版本到项目“${project.title}”` });
+    this.scheduleSave(next, { dirtyProjectId: project.id });
     if (!issues.length) this.scheduleCheck(80);
   }
 
@@ -221,7 +308,13 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
       const workspace = saved ?? createDemoWorkspace();
       const project = workspace.projects.find((candidate) => candidate.id === workspace.activeProjectId) ?? workspace.projects[0];
       const issues = ruleDomain.validateProject(project);
-      this.publish({ ...this.state, workspace, project, phase: issues.length ? 'validating' : 'editing', persistence: saved ? 'saved' : 'saving', activeModule: 'inspection', checkStatus: issues.length ? 'idle' : 'scheduled', validationIssues: issues, analysis: null, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice: saved ? '已从本地恢复最近项目' : '已载入演示项目，可直接修改并检查规则' });
+      this.publish({
+        ...this.activateProject(workspace, project),
+        phase: issues.length ? 'validating' : 'editing',
+        persistence: saved ? 'saved' : 'saving',
+        checkStatus: issues.length ? 'idle' : 'scheduled',
+        notice: saved ? '已从本地恢复最近项目' : '已载入演示项目，可直接修改并检查规则',
+      });
       if (saved) this.scheduleCheck(40);
       else {
         this.scheduleSave(workspace);
@@ -251,7 +344,7 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
       selectedRuleId: updated.rules.some((rule) => rule.id === this.state.selectedRuleId) ? this.state.selectedRuleId : updated.rules[0]?.id,
       notice,
     });
-    this.scheduleSave(next);
+    this.scheduleSave(next, { dirtyProjectId: updated.id });
     if (recheck && !issues.length) this.scheduleCheck(180);
     else if (issues.length) this.cancelPendingCheck();
   }
@@ -275,22 +368,101 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     }
   }
 
-  private scheduleSave(workspace: WorkspaceDocument): void {
+  private scheduleSave(workspace: WorkspaceDocument, options: { dirtyProjectId?: string } = {}): void {
     const revision = ++this.saveRevision;
     if (this.saveTimer) clearTimeout(this.saveTimer);
-    this.publish({ ...this.state, persistence: 'saving', saveError: undefined });
+    let dirtyProjectIds = this.state.dirtyProjectIds;
+    if (options.dirtyProjectId) dirtyProjectIds = this.withDirty(dirtyProjectIds, options.dirtyProjectId, true);
+    // A document write always reflects the latest set; ids for removed projects must not linger.
+    dirtyProjectIds = dirtyProjectIds.filter((id) => workspace.projects.some((project) => project.id === id));
+    this.publish({ ...this.state, persistence: 'saving', saveError: undefined, dirtyProjectIds });
     this.saveTimer = setTimeout(() => {
       this.saveTimer = undefined;
-      this.enqueueSave(workspace, revision);
+      this.enqueueSave(workspace, revision, dirtyProjectIds);
     }, 220);
   }
 
-  private enqueueSave(workspace: WorkspaceDocument, revision: number): void {
+  private enqueueSave(workspace: WorkspaceDocument, revision: number, pendingDirtyIds: string[]): void {
     this.writeQueue = this.writeQueue.catch(() => undefined).then(() => this.repository.save(workspace)).then(() => {
-      if (revision === this.saveRevision) this.publish({ ...this.state, persistence: 'saved', saveError: undefined });
+      if (revision !== this.saveRevision) return;
+      this.publish({ ...this.state, persistence: 'saved', saveError: undefined, dirtyProjectIds: [] });
     }).catch((error: unknown) => {
-      if (revision === this.saveRevision) this.publish({ ...this.state, persistence: 'error', saveError: error instanceof Error ? error.message : '保存失败' });
+      if (revision !== this.saveRevision) return;
+      // Keep showing the projects whose edits failed to land so they can be confirmed/deleted safely.
+      this.publish({ ...this.state, persistence: 'error', saveError: error instanceof Error ? error.message : '保存失败', dirtyProjectIds: pendingDirtyIds });
     });
+  }
+
+  /**
+   * Build the transient view state for entering a project. Everything derived
+   * from project content is rebuilt here so stale analysis, selected rule or
+   * sample evaluation from another project can never carry over.
+   */
+  private activateProject(
+    workspace: WorkspaceDocument,
+    project: RuleProject,
+    overrides: Partial<WorkspaceState> = {},
+  ): WorkspaceState {
+    const issues = ruleDomain.validateProject(project);
+    return {
+      ...this.state,
+      workspace,
+      project,
+      activeModule: overrides.activeModule ?? 'inspection',
+      phase: overrides.phase ?? (issues.length ? 'validating' : 'editing'),
+      checkStatus: overrides.checkStatus ?? (issues.length ? 'idle' : 'scheduled'),
+      analysis: null,
+      validationIssues: issues,
+      sampleEvaluation: evaluateSample(project, project.sampleInputs),
+      selectedRuleId: project.rules[0]?.id,
+      notice: overrides.notice ?? '',
+      saveError: undefined,
+      ...overrides,
+    };
+  }
+
+  private deleteProject(targetId: string): void {
+    const workspace = this.state.workspace;
+    if (!workspace || !workspace.projects.some((candidate) => candidate.id === targetId)) return;
+    const target = workspace.projects.find((candidate) => candidate.id === targetId);
+    const wasActive = workspace.activeProjectId === targetId;
+    // Discard pending saves and computations that belonged to the removed project.
+    // cancelPendingCheck() does not publish, so it can't leak a notice/result here.
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = undefined;
+    }
+    if (wasActive) this.cancelPendingCheck();
+    const remaining = workspace.projects.filter((candidate) => candidate.id !== targetId);
+    const fallback = remaining[0];
+    const next: WorkspaceDocument = { ...workspace, projects: remaining, activeProjectId: wasActive ? fallback.id : workspace.activeProjectId };
+    const landing = remaining.find((candidate) => candidate.id === next.activeProjectId) ?? fallback;
+    const dirtyProjectIds = this.withDirty(this.state.dirtyProjectIds, targetId, false);
+    if (wasActive && landing) {
+      const issues = ruleDomain.validateProject(landing);
+      this.publish({
+        ...this.activateProject(next, landing),
+        phase: issues.length ? 'validating' : 'editing',
+        checkStatus: issues.length ? 'idle' : 'scheduled',
+        dirtyProjectIds,
+        notice: `已删除“${target?.title ?? '项目'}”，已切换到“${landing.title}”`,
+      });
+      this.scheduleSave(next);
+      if (!issues.length) this.scheduleCheck(80);
+    } else {
+      this.publish({ ...this.state, workspace: next, dirtyProjectIds, notice: `已删除项目“${target?.title ?? ''}”` });
+      this.scheduleSave(next);
+    }
+  }
+
+  private isDirty(projectId: string): boolean {
+    return this.state.dirtyProjectIds.includes(projectId);
+  }
+
+  private withDirty(ids: string[], projectId: string, dirty: boolean): string[] {
+    const present = ids.includes(projectId);
+    if (dirty) return present ? ids : [...ids, projectId];
+    return present ? ids.filter((id) => id !== projectId) : ids;
   }
 
   private publish(state: WorkspaceState): void {
