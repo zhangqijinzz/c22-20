@@ -49,6 +49,7 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
   private checkRevision = 0;
   private saveRevision = 0;
   private writeQueue: Promise<void> = Promise.resolve();
+  private readonly dirtyProjectIds = new Set<string>();
 
   constructor(
     private readonly repository: WorkspaceRepository = new RuleRepository(new ProjectStorageService()),
@@ -157,8 +158,10 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
   createProject(): void {
     const workspace = this.state.workspace;
     if (!workspace) return;
+    this.cancelCheck();
     const project = createBlankProject(workspace.projects.length + 1);
     const next: WorkspaceDocument = { ...workspace, projects: [...workspace.projects, project], activeProjectId: project.id };
+    this.dirtyProjectIds.add(project.id);
     this.publish({ ...this.state, workspace: next, project, phase: 'validating', activeModule: 'fields', analysis: null, checkStatus: 'idle', validationIssues: ruleDomain.validateProject(project), sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: undefined, notice: '空项目已创建。先定义字段，再添加规则。' });
     this.scheduleSave(next);
   }
@@ -167,12 +170,72 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     const workspace = this.state.workspace;
     const project = workspace?.projects.find((candidate) => candidate.id === projectId);
     if (!workspace || !project || workspace.activeProjectId === projectId) return;
-    this.cancelCheck();
     const next = { ...workspace, activeProjectId: projectId };
-    const issues = ruleDomain.validateProject(project);
-    this.publish({ ...this.state, workspace: next, project, phase: issues.length ? 'validating' : 'editing', activeModule: 'inspection', checkStatus: issues.length ? 'idle' : 'scheduled', analysis: null, validationIssues: issues, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice: `已切换到“${project.title}”` });
+    this.activateProject(next, project, 'inspection', `已切换到“${project.title}”`);
+  }
+
+  hasUnsavedChanges(projectId: string): boolean {
+    return this.dirtyProjectIds.has(projectId);
+  }
+
+  duplicateProject(projectId: string): void {
+    const workspace = this.state.workspace;
+    const source = workspace?.projects.find((candidate) => candidate.id === projectId);
+    if (!workspace || !source) return;
+    const project: RuleProject = {
+      id: makeId('project'), title: this.nextCopyTitle(source.title),
+      fields: cloneData(source.fields), rules: cloneData(source.rules), sampleInputs: cloneData(source.sampleInputs),
+      versions: source.versions.map((version) => ({ ...cloneData(version), id: makeId('version') })),
+      updatedAt: Date.now(),
+    };
+    const next: WorkspaceDocument = { ...workspace, projects: [...workspace.projects, project], activeProjectId: project.id };
+    this.dirtyProjectIds.add(project.id);
+    this.activateProject(next, project, 'rules', `已复制“${source.title}”为“${project.title}”：字段、规则、样例输入与 ${source.versions.length} 条版本记录均已带入副本`);
+  }
+
+  deleteProject(projectId: string, options: { force?: boolean } = {}): boolean {
+    const workspace = this.state.workspace;
+    const targetIndex = workspace?.projects.findIndex((candidate) => candidate.id === projectId) ?? -1;
+    const target = targetIndex >= 0 ? workspace?.projects[targetIndex] : undefined;
+    if (!workspace || !target) return false;
+    if (workspace.projects.length <= 1) {
+      this.updateView({ notice: '至少保留一个规则项目，无法删除。' });
+      return false;
+    }
+    if (this.hasUnsavedChanges(projectId) && !options.force) {
+      this.updateView({ notice: `项目“${target.title}”还有未保存的更改，请确认后再删除。` });
+      return false;
+    }
+    const projects = workspace.projects.filter((candidate) => candidate.id !== projectId);
+    this.dirtyProjectIds.delete(projectId);
+    if (workspace.activeProjectId !== projectId) {
+      const next: WorkspaceDocument = { ...workspace, projects };
+      this.publish({ ...this.state, workspace: next, notice: `已删除项目“${target.title}”` });
+      this.scheduleSave(next);
+      return true;
+    }
+    const project = projects[Math.min(targetIndex, projects.length - 1)];
+    const next: WorkspaceDocument = { ...workspace, projects, activeProjectId: project.id };
+    this.activateProject(next, project, 'inspection', `已删除项目“${target.title}”，已切换到“${project.title}”`);
+    return true;
+  }
+
+  renameProjectById(projectId: string, title: string): boolean {
+    const workspace = this.state.workspace;
+    const target = workspace?.projects.find((candidate) => candidate.id === projectId);
+    const nextTitle = title.trim();
+    if (!workspace || !target) return false;
+    if (!nextTitle) {
+      this.updateView({ notice: '项目名称不能为空。' });
+      return false;
+    }
+    if (target.title === nextTitle) return true;
+    const renamed: RuleProject = { ...target, title: nextTitle, updatedAt: Date.now() };
+    const next: WorkspaceDocument = { ...workspace, projects: workspace.projects.map((candidate) => candidate.id === projectId ? renamed : candidate) };
+    this.dirtyProjectIds.add(projectId);
+    this.publish({ ...this.state, workspace: next, project: this.state.project?.id === projectId ? renamed : this.state.project, notice: `项目已重命名为“${nextTitle}”` });
     this.scheduleSave(next);
-    if (!issues.length) this.scheduleCheck(80);
+    return true;
   }
 
   saveVersion(): void {
@@ -208,10 +271,8 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
       versions: [], updatedAt: Date.now(),
     };
     const next = { ...workspace, projects: [...workspace.projects, project], activeProjectId: project.id };
-    const issues = ruleDomain.validateProject(project);
-    this.publish({ ...this.state, workspace: next, project, phase: issues.length ? 'validating' : 'editing', activeModule: 'rules', checkStatus: issues.length ? 'idle' : 'scheduled', analysis: null, validationIssues: issues, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice: `已复制版本到项目“${project.title}”` });
-    this.scheduleSave(next);
-    if (!issues.length) this.scheduleCheck(80);
+    this.dirtyProjectIds.add(project.id);
+    this.activateProject(next, project, 'rules', `已复制版本到项目“${project.title}”`);
   }
 
   private async initialize(): Promise<void> {
@@ -220,6 +281,7 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
       const saved = await this.repository.load();
       const workspace = saved ?? createDemoWorkspace();
       const project = workspace.projects.find((candidate) => candidate.id === workspace.activeProjectId) ?? workspace.projects[0];
+      if (!saved) this.dirtyProjectIds.add(project.id);
       const issues = ruleDomain.validateProject(project);
       this.publish({ ...this.state, workspace, project, phase: issues.length ? 'validating' : 'editing', persistence: saved ? 'saved' : 'saving', activeModule: 'inspection', checkStatus: issues.length ? 'idle' : 'scheduled', validationIssues: issues, analysis: null, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice: saved ? '已从本地恢复最近项目' : '已载入演示项目，可直接修改并检查规则' });
       if (saved) this.scheduleCheck(40);
@@ -232,6 +294,23 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     }
   }
 
+  private activateProject(next: WorkspaceDocument, project: RuleProject, module: ModuleId, notice: string): void {
+    this.cancelCheck();
+    const issues = ruleDomain.validateProject(project);
+    this.publish({ ...this.state, workspace: next, project, phase: issues.length ? 'validating' : 'editing', activeModule: module, checkStatus: issues.length ? 'idle' : 'scheduled', analysis: null, validationIssues: issues, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice });
+    this.scheduleSave(next);
+    if (!issues.length) this.scheduleCheck(80);
+  }
+
+  private nextCopyTitle(sourceTitle: string): string {
+    const titles = new Set((this.state.workspace?.projects ?? []).map((project) => project.title));
+    const base = `${sourceTitle} 副本`;
+    if (!titles.has(base)) return base;
+    let index = 2;
+    while (titles.has(`${base} ${index}`)) index += 1;
+    return `${base} ${index}`;
+  }
+
   private replaceProject(project: RuleProject, notice: string, recheck: boolean, allowFrozen = false): void {
     const workspace = this.state.workspace;
     if (!workspace) return;
@@ -242,6 +321,7 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     const updated = { ...project, updatedAt: Date.now() };
     const next = { ...workspace, projects: workspace.projects.map((candidate) => candidate.id === updated.id ? updated : candidate) };
     const issues = ruleDomain.validateProject(updated);
+    this.dirtyProjectIds.add(updated.id);
     this.publish({
       ...this.state, workspace: next, project: updated,
       phase: issues.length ? 'validating' : 'editing', validationIssues: issues,
@@ -287,7 +367,10 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
 
   private enqueueSave(workspace: WorkspaceDocument, revision: number): void {
     this.writeQueue = this.writeQueue.catch(() => undefined).then(() => this.repository.save(workspace)).then(() => {
-      if (revision === this.saveRevision) this.publish({ ...this.state, persistence: 'saved', saveError: undefined });
+      if (revision === this.saveRevision) {
+        this.dirtyProjectIds.clear();
+        this.publish({ ...this.state, persistence: 'saved', saveError: undefined });
+      }
     }).catch((error: unknown) => {
       if (revision === this.saveRevision) this.publish({ ...this.state, persistence: 'error', saveError: error instanceof Error ? error.message : '保存失败' });
     });
